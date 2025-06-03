@@ -37,7 +37,104 @@
     <button id="start">start</button>
     <label>Show face boxes <input id="showboxes" type="checkbox"></label>
     <script>
-        // Configuration constant for detection frequency
+        class FaceDetector {
+            constructor(options = {}) {
+                this.model = options.model || 'short';
+                this.minDetectionConfidence = options.minDetectionConfidence || 0.6;
+                this.maxNumFaces = options.maxNumFaces || 1;
+                this.faceDetection = null;
+                this.isInitialized = false;
+                this.isDestroyed = false;
+                this.initializationPromise = null;
+            }
+
+            async initialize() {
+                // If already initialized or destroyed, return immediately
+                if (this.isInitialized || this.isDestroyed) {
+                    return;
+                }
+
+                // If initialization is already in progress, wait for it
+                if (this.initializationPromise) {
+                    return this.initializationPromise;
+                }
+
+                // Start initialization and store the promise
+                this.initializationPromise = this._doInitialize();
+                
+                try {
+                    await this.initializationPromise;
+                } finally {
+                    // Clear the promise once initialization is complete (success or failure)
+                    this.initializationPromise = null;
+                }
+            }
+
+            async _doInitialize() {
+                try {
+                    this.faceDetection = new FaceDetection({
+                        locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
+                    });
+                    
+                    this.faceDetection.setOptions({
+                        model: this.model,
+                        minDetectionConfidence: this.minDetectionConfidence,
+                        maxNumFaces: this.maxNumFaces,
+                    });
+
+                    this.isInitialized = true;
+                    console.log('FaceDetector initialized successfully');
+                } catch (error) {
+                    console.error('Failed to initialize FaceDetector:', error);
+                    throw error;
+                }
+            }
+
+            async detect(videoElement) {
+                if (!this.isInitialized) {
+                    await this.initialize();
+                }
+
+                if (this.isDestroyed) {
+                    throw new Error('FaceDetector has been destroyed');
+                }
+
+                return new Promise((resolve, reject) => {
+                    const startTime = performance.now();
+                    
+                    // Set up one-time result handler
+                    const onResults = (results) => {
+                        const inferenceTime = performance.now() - startTime;
+                        console.log(`Face detection inference time: ${inferenceTime.toFixed(2)}ms`);
+                        
+                        // Remove the listener to prevent memory leaks
+                        this.faceDetection.onResults(() => {});
+                        
+                        resolve({
+                            detections: results.detections || [],
+                            inferenceTime: inferenceTime
+                        });
+                    };
+
+                    this.faceDetection.onResults(onResults);
+                    
+                    // Send the video frame for detection
+                    this.faceDetection.send({image: videoElement}).catch(reject);
+                });
+            }
+
+            destroy() {
+                if (this.faceDetection) {
+                    this.faceDetection.close();
+                    this.faceDetection = null;
+                }
+                this.isInitialized = false;
+                this.isDestroyed = true;
+                console.log('FaceDetector destroyed');
+            }
+        }
+
+        // Configuration constants
         const DETECTION_INTERVAL_MS = 1000; // 1 second - configurable
         const VW = 640; // Video width
         const VH = 480; // Video height
@@ -62,36 +159,24 @@
 
         const ctx = canvas.getContext('2d');
         const startButton = document.getElementById('start');
-          let faceDetection;
+
+        const faceDetector = new FaceDetector({
+            model: 'short',
+            minDetectionConfidence: 0.6,
+            maxNumFaces: 1
+        });
+
         let stream;
         let detectionTimer;
-        let inferenceStartTime = 0;
         
         function getCurrentPosition() {
-            // Get current video position
             return currentPosition;
         }
 
         function moveToPosition(position) {
             currentPosition = position;
-            // Move video and canvas to the specified position
             videoElement.style.transform = `translateX(${position}px)`;
             canvas.style.transform = `translateX(${position}px)`;
-        }
-
-        // Initialize MediaPipe Face Detection
-        function initializeFaceDetection() {
-            faceDetection = new FaceDetection({
-                locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`
-            });
-            
-            faceDetection.setOptions({
-                model: 'short', // Use BlazeFace short model
-                minDetectionConfidence: 0.6,
-                maxNumFaces: 1,
-            });
-            
-            faceDetection.onResults(onResults);
         }
         
         let detectionResults, targetDetection;
@@ -100,9 +185,7 @@
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             
             if (!showBoxesCheckbox.checked || !detectionResults || !detectionResults.detections) return;
-            
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            // Draw bounding boxes for all faces (but only track the closest to center)
+
             detectionResults.detections.forEach((detection, index) => {
                 const bbox = detection.boundingBox;
                 const x = bbox.xCenter * canvas.width - (bbox.width * canvas.width) / 2;
@@ -110,12 +193,11 @@
                 const width = bbox.width * canvas.width;
                 const height = bbox.height * canvas.height;
                 
-                // Draw different colors for tracked vs non-tracked faces
                 if (detection === targetDetection) {
-                    ctx.strokeStyle = 'red'; // Tracked face in red
+                    ctx.strokeStyle = 'red'; // Tracked face
                     ctx.lineWidth = 2;
                 } else {
-                    ctx.strokeStyle = 'orange'; // Other faces in orange
+                    ctx.strokeStyle = 'orange'; // Other faces
                     ctx.lineWidth = 1;
                 }
                 ctx.strokeRect(x, y, width, height);
@@ -124,21 +206,15 @@
 
         showBoxesCheckbox.addEventListener('change', renderBoxes);
 
-        // Handle detection results
-        function onResults(results) {
-            const inferenceTime = performance.now() - inferenceStartTime;
-            console.log(`Total inference time: ${inferenceTime.toFixed(2)}ms`);
+        function handleDetectionResults(results) {
             detectionResults = results;
             targetDetection = results.detections && results.detections.length > 0 ? results.detections[0] : null;
 
-            // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             
             if (results.detections && results.detections.length > 0) {
-                // Log full detection results to console
                 console.log('Face detection results:', results);
                 
-                // Find the face closest to center if multiple faces detected
                 let targetDetection = results.detections[0];
                 
                 if (TRACK_FACE) {
@@ -161,7 +237,6 @@
                     const faceX = bbox.xCenter * VW - (bbox.width * VW) / 2;
                     const faceWidth = bbox.width * VW;
                     
-                    // Get current video position
                     const currentLeft = getCurrentPosition();
                     
                     // Calculate face position relative to visible area
@@ -196,12 +271,10 @@
 
             renderBoxes();
         }
-          // Start camera and face detection
+        
+        // Start camera and face detection
         async function startFaceTracking() {
             try {
-                // Initialize face detection
-                initializeFaceDetection();
-                
                 // Get user media stream
                 stream = await navigator.mediaDevices.getUserMedia({
                     video: { width: VW, height: VH }
@@ -221,9 +294,8 @@
                 // Start detection timer (run detection once per second)
                 detectionTimer = setInterval(async () => {
                     try {
-                        inferenceStartTime = performance.now();
-                        await faceDetection.send({image: videoElement});
-                        console.log(`Inference send required ${performance.now() - inferenceStartTime} ms`);
+                        const results = await faceDetector.detect(videoElement);
+                        handleDetectionResults(results);
                     } catch (error) {
                         console.error('Detection error:', error);
                     }
@@ -239,7 +311,8 @@
                 alert('Error accessing camera. Please make sure you have granted camera permissions.');
             }
         }
-          // Stop face tracking
+        
+        // Stop face tracking
         function stopFaceTracking() {
             if (detectionTimer) {
                 clearInterval(detectionTimer);
@@ -264,6 +337,10 @@
         // Set up start button
         startButton.onclick = startFaceTracking;
         
+        // Clean up resources when page is unloaded
+        window.addEventListener('beforeunload', () => {
+            faceDetector.destroy();
+        });
     </script>
 </body>
 </html>
