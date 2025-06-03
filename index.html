@@ -6,12 +6,30 @@
     <title>Face tracker</title>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
     <style>
-        #wrapper {
+        #videos {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .wrapper {
             position: relative;
             height: 480px;
             overflow: hidden;
+            border-radius: 10px;
         }
-        #wrapper canvas, #wrapper video {
+        .stop-button {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background: rgba(255, 0, 0, 0.5);
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            color: white;
+            border: none;
+            padding: 0;
+        }
+        .wrapper canvas, .wrapper video  {
             position: absolute;
             top: 0;
             left: 0;
@@ -20,20 +38,17 @@
             transition: transform 0.7s ease-in-out;
             transform: translateX(0);
         }
-        #wrapper video {
+        .wrapper video {
             z-index: 0;
         }
-        #wrapper canvas {
+        .wrapper canvas {
             pointer-events: none;
             z-index: 2;
         }
     </style>
 </head>
 <body>
-    <div id="wrapper">
-        <canvas id="canvas" width="640" height="480"></canvas>
-        <video autoplay muted playsinline id="videoElement"></video>
-    </div>
+    <div id="videos"></div>
     <button id="start">start</button>
     <label>Show face boxes <input id="showboxes" type="checkbox"></label>
     <script>
@@ -46,6 +61,7 @@
                 this.isInitialized = false;
                 this.isDestroyed = false;
                 this.initializationPromise = null;
+                this.detectPromise = null;
             }
 
             async initialize() {
@@ -99,7 +115,11 @@
                     throw new Error('FaceDetector has been destroyed');
                 }
 
-                return new Promise((resolve, reject) => {
+                while (this.detectPromise) {                
+                    await this.detectPromise;
+                }
+
+                const result = new Promise((resolve, reject) => {
                     const startTime = performance.now();
                     
                     // Set up one-time result handler
@@ -121,6 +141,15 @@
                     // Send the video frame for detection
                     this.faceDetection.send({image: videoElement}).catch(reject);
                 });
+
+                this.detectPromise = result;
+                result.finally(() => {
+                    if (this.detectPromise === result) {
+                        this.detectPromise = null; // Clear the promise after use
+                    }
+                });
+
+                return result;
             }
 
             destroy() {
@@ -134,31 +163,222 @@
             }
         }
 
-        // Configuration constants
-        const DETECTION_INTERVAL_MS = 1000; // 1 second - configurable
-        const VW = 640; // Video width
-        const VH = 480; // Video height
-        const VISIBLE_WIDTH = 300; // Wrapper width
-        const MIN_EDGE_DISTANCE = 10; // px
+        class VideoTile {
+            static TRACK_FACE = true; // Whether to track the face
+            static DETECTION_INTERVAL_MS = 1000; // Detection interval in milliseconds
+            static MIN_EDGE_DISTANCE = 20; // Minimum distance from edges in pixels
 
-        const TRACK_FACE = true; // Enable face tracking
-        let currentPosition = 0; // Current video position
-        
-        const wrapper = document.getElementById('wrapper');
-        wrapper.style.width = VISIBLE_WIDTH + 'px';
-        const videoElement = document.getElementById('videoElement');
-        videoElement.width = VW;
-        videoElement.height = VH;
-        const canvas = document.getElementById('canvas');
-        canvas.width = VW;
-        canvas.height = VH;
-        
+            /**
+             * @param {FaceDetector} faceDetector
+             */
+            constructor(faceDetector, width = 640, height = 480, visibleWidth = 300, showBoxes = false) {
+                this.faceDetector = faceDetector;
+                this.width = width;
+                this.height = height;
+                this.visibleWidth = visibleWidth;
+                this.detectionResults = null;
+                this.targetDetection = null;
+                this.showBoxes = showBoxes;
+                this.init();
+                this.changePosition((visibleWidth - width) / 2);
+            }
+
+            init() {
+                this.videoElement = document.createElement('video');
+                this.videoElement.width = this.width;
+                this.videoElement.height = this.height;
+                this.videoElement.autoplay = true;
+                this.videoElement.muted = true;
+                this.videoElement.playsInline = true;
+
+                this.canvas = document.createElement('canvas');
+                this.canvas.width = this.width;
+                this.canvas.height = this.height;
+                this.ctx = this.canvas.getContext('2d');
+                
+                this.wrapper = document.createElement('div');
+                this.wrapper.className = 'wrapper';
+                this.wrapper.style.width = `${this.visibleWidth}px`;
+
+                this.wrapper.appendChild(this.canvas);
+                this.wrapper.appendChild(this.videoElement);
+            }
+
+            get Element() {
+                return this.wrapper;
+            }
+
+            async start(deviceId) {
+                try {
+                    const constraints = {
+                        video: {
+                            width: this.width,
+                            height: this.height,
+                        }
+                    };
+                    if (deviceId) {
+                        constraints.video.deviceId = { exact: deviceId };
+                        console.log(`Using camera ID: ${deviceId}`);
+                    }
+                    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                    const [track] = stream.getVideoTracks();
+                    console.log(`Using video device: ${track.label}`);
+                    
+                    // Set video source to the stream
+                    this.videoElement.srcObject = stream;
+                    
+                    // Wait for video to be ready
+                    await new Promise((resolve) => {
+                        this.videoElement.onloadedmetadata = () => {
+                            this.videoElement.play();
+                            resolve();
+                        };
+                    });
+
+                    this.startDetection();
+                } catch (error) {
+                    console.error('Error starting video tile:', error);
+                }
+            }
+
+            async startDetection() {
+                this.detectionInterval = setInterval(async () => {
+                    try {
+                        const results = await this.faceDetector.detect(this.videoElement);
+                        this.handleDetectionResults(results);
+                    } catch (error) {
+                        console.error('Detection error:', error);
+                    }
+                }, VideoTile.DETECTION_INTERVAL_MS);
+            }
+
+            handleDetectionResults(results) {
+                this.detectionResults = results;
+                
+                if (!results.detections || results.detections.length === 0) {
+                    console.log('No faces detected - maintaining current position');
+                    this.targetDetection = null;
+                    this.renderBoxes();
+                    return;
+                }
+                
+                this.targetDetection = results.detections[0];
+
+                console.log('Face detection results:', results);
+
+                let targetDetection = results.detections[0];
+
+                if (results.detections.length > 1) {
+                    const centerX = 0.5; // Center of video in normalized coordinates
+                    let minDistanceToCenter = Math.abs(results.detections[0].boundingBox.xCenter - centerX);
+                    
+                    for (let i = 1; i < results.detections.length; i++) {
+                        const distance = Math.abs(results.detections[i].boundingBox.xCenter - centerX);
+                        if (distance < minDistanceToCenter) {
+                            minDistanceToCenter = distance;
+                            targetDetection = results.detections[i];
+                        }
+                    }
+                    console.log(`Multiple faces detected, using closest to center (distance: ${minDistanceToCenter.toFixed(3)})`);
+                }
+                    
+                if (!VideoTile.TRACK_FACE) {
+                    this.renderBoxes();
+                    return;
+                }
+
+                // Calculate face bounding box in pixel coordinates
+                const bbox = targetDetection.boundingBox;
+                const faceX = bbox.xCenter * this.width - (bbox.width * this.width) / 2;
+                const faceWidth = bbox.width * this.width;
+                
+                const currentLeft = this.position;
+                
+                // Calculate face position relative to visible area
+                const faceLeftInVisible = faceX + currentLeft;
+                const faceRightInVisible = faceLeftInVisible + faceWidth;
+                
+                // Check if face is too close to edges of visible area
+                let newLeft = currentLeft;
+                
+                if (faceLeftInVisible < VideoTile.MIN_EDGE_DISTANCE) {
+                    // Face is too close to left edge, move video right
+                    newLeft = VideoTile.MIN_EDGE_DISTANCE - faceX;
+                } else if (faceRightInVisible > this.visibleWidth - VideoTile.MIN_EDGE_DISTANCE) {
+                    // Face is too close to right edge, move video left
+                    newLeft = (this.visibleWidth - VideoTile.MIN_EDGE_DISTANCE) - (faceX + faceWidth);
+                }
+                
+                // Clamp newLeft to prevent video from moving too far
+                const maxLeft = 0; // Video can't go beyond right edge
+                const minLeft = this.visibleWidth - this.width; // Video can't go beyond left edge
+                newLeft = Math.max(minLeft, Math.min(maxLeft, newLeft));
+                
+                // Apply the new position if it changed
+                if (newLeft !== currentLeft) {
+                    this.changePosition(newLeft);
+                    console.log(`Adjusted video position: ${currentLeft}px → ${newLeft}px`);
+                }
+
+                this.renderBoxes();
+            }
+
+            changePosition(newPosition) {
+                this.position = newPosition;
+                this.videoElement.style.transform = `translateX(${this.position}px)`;
+                this.canvas.style.transform = `translateX(${this.position}px)`;
+            }
+
+            renderBoxes() {
+                const { width, height } = this.canvas;
+                this.ctx.clearRect(0, 0, width, height);
+                
+                if (!this.showBoxes || !this.detectionResults || !this.detectionResults.detections) return;
+
+                this.detectionResults.detections.forEach((detection, index) => {
+                    const bbox = detection.boundingBox;
+                    const x = bbox.xCenter * width - (bbox.width * width) / 2;
+                    const y = bbox.yCenter * height - (bbox.height * height) / 2;
+                    const w = bbox.width * width;
+                    const h = bbox.height * height;
+                    
+                    if (detection === this.targetDetection) {
+                        this.ctx.strokeStyle = 'red'; // Tracked face
+                        this.ctx.lineWidth = 2;
+                    } else {
+                        this.ctx.strokeStyle = 'orange'; // Other faces
+                        this.ctx.lineWidth = 1;
+                    }
+                    this.ctx.strokeRect(x, y, w, h);
+                });
+            }
+
+            setShowBoxes(value = false) {
+                this.showBoxes = value;
+                this.renderBoxes();
+            }
+
+            stop() {
+                if (this.detectionInterval) {
+                    clearInterval(this.detectionInterval);
+                    this.detectionInterval = null;
+                }
+                
+                if (this.videoElement.srcObject) {
+                    const tracks = this.videoElement.srcObject.getTracks();
+                    tracks.forEach(track => track.stop());
+                    this.videoElement.srcObject = null;
+                }
+                
+                this.detectionResults = null;
+                this.targetDetection = null;
+                this.renderBoxes();
+            }
+        }
+
         const showBoxesCheckbox = document.getElementById('showboxes');
-
-        moveToPosition((VISIBLE_WIDTH - VW) / 2); // Initial position
-
-        const ctx = canvas.getContext('2d');
         const startButton = document.getElementById('start');
+        const videosContainer = document.getElementById('videos');
 
         const faceDetector = new FaceDetector({
             model: 'short',
@@ -166,181 +386,68 @@
             maxNumFaces: 1
         });
 
-        let stream;
-        let detectionTimer;
-        
-        function getCurrentPosition() {
-            return currentPosition;
-        }
+        const tiles = [];
 
-        function moveToPosition(position) {
-            currentPosition = position;
-            videoElement.style.transform = `translateX(${position}px)`;
-            canvas.style.transform = `translateX(${position}px)`;
-        }
-        
-        let detectionResults, targetDetection;
+        showBoxesCheckbox.onchange = () => tiles.forEach(tile => tile.setShowBoxes(showBoxesCheckbox.checked));
 
-        function renderBoxes() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        async function startTile() {
+            const videoTile = new VideoTile(faceDetector, 640, 480, 300, showBoxesCheckbox.checked);
+            tiles.push(videoTile);
+            videosContainer.append(videoTile.Element);
+            const stopButton = document.createElement('button');
+            stopButton.innerHTML = '&times;';
+            stopButton.className = 'stop-button';
+            stopButton.onclick = () => {
+                videoTile.stop();
+                videosContainer.removeChild(videoTile.Element);
+                tiles.splice(tiles.indexOf(videoTile), 1);
+            };
+            videoTile.Element.appendChild(stopButton);
             
-            if (!showBoxesCheckbox.checked || !detectionResults || !detectionResults.detections) return;
-
-            detectionResults.detections.forEach((detection, index) => {
-                const bbox = detection.boundingBox;
-                const x = bbox.xCenter * canvas.width - (bbox.width * canvas.width) / 2;
-                const y = bbox.yCenter * canvas.height - (bbox.height * canvas.height) / 2;
-                const width = bbox.width * canvas.width;
-                const height = bbox.height * canvas.height;
-                
-                if (detection === targetDetection) {
-                    ctx.strokeStyle = 'red'; // Tracked face
-                    ctx.lineWidth = 2;
-                } else {
-                    ctx.strokeStyle = 'orange'; // Other faces
-                    ctx.lineWidth = 1;
-                }
-                ctx.strokeRect(x, y, width, height);
-            });
-        }
-
-        showBoxesCheckbox.addEventListener('change', renderBoxes);
-
-        function handleDetectionResults(results) {
-            detectionResults = results;
-            targetDetection = results.detections && results.detections.length > 0 ? results.detections[0] : null;
-
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            if (results.detections && results.detections.length > 0) {
-                console.log('Face detection results:', results);
-                
-                let targetDetection = results.detections[0];
-                
-                if (TRACK_FACE) {
-                    if (results.detections.length > 1) {
-                        const centerX = 0.5; // Center of video in normalized coordinates
-                        let minDistanceToCenter = Math.abs(results.detections[0].boundingBox.xCenter - centerX);
-                        
-                        for (let i = 1; i < results.detections.length; i++) {
-                            const distance = Math.abs(results.detections[i].boundingBox.xCenter - centerX);
-                            if (distance < minDistanceToCenter) {
-                                minDistanceToCenter = distance;
-                                targetDetection = results.detections[i];
-                            }
-                        }
-                        console.log(`Multiple faces detected, using closest to center (distance: ${minDistanceToCenter.toFixed(3)})`);
-                    }
-                    
-                    // Calculate face bounding box in pixel coordinates
-                    const bbox = targetDetection.boundingBox;
-                    const faceX = bbox.xCenter * VW - (bbox.width * VW) / 2;
-                    const faceWidth = bbox.width * VW;
-                    
-                    const currentLeft = getCurrentPosition();
-                    
-                    // Calculate face position relative to visible area
-                    const faceLeftInVisible = faceX + currentLeft;
-                    const faceRightInVisible = faceLeftInVisible + faceWidth;
-                    
-                    // Check if face is too close to edges of visible area
-                    let newLeft = currentLeft;
-                    
-                    if (faceLeftInVisible < MIN_EDGE_DISTANCE) {
-                        // Face is too close to left edge, move video right
-                        newLeft = MIN_EDGE_DISTANCE - faceX;
-                    } else if (faceRightInVisible > VISIBLE_WIDTH - MIN_EDGE_DISTANCE) {
-                        // Face is too close to right edge, move video left
-                        newLeft = (VISIBLE_WIDTH - MIN_EDGE_DISTANCE) - (faceX + faceWidth);
-                    }
-                    
-                    // Clamp newLeft to prevent video from moving too far
-                    const maxLeft = 0; // Video can't go beyond right edge
-                    const minLeft = VISIBLE_WIDTH - VW; // Video can't go beyond left edge
-                    newLeft = Math.max(minLeft, Math.min(maxLeft, newLeft));
-                    
-                    // Apply the new position if it changed
-                    if (newLeft !== currentLeft) {
-                        moveToPosition(newLeft);
-                        console.log(`Adjusted video position: ${currentLeft}px → ${newLeft}px`);
-                    }
-                }
-            } else {
-                console.log('No faces detected - maintaining current position');
-            }
-
-            renderBoxes();
-        }
-        
-        // Start camera and face detection
-        async function startFaceTracking() {
             try {
-                // Get user media stream
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: VW, height: VH }
-                });
-                
-                // Set video source to the stream
-                videoElement.srcObject = stream;
-                
-                // Wait for video to be ready
-                await new Promise((resolve) => {
-                    videoElement.onloadedmetadata = () => {
-                        videoElement.play();
-                        resolve();
-                    };
-                });
-                
-                // Start detection timer (run detection once per second)
-                detectionTimer = setInterval(async () => {
-                    try {
-                        const results = await faceDetector.detect(videoElement);
-                        handleDetectionResults(results);
-                    } catch (error) {
-                        console.error('Detection error:', error);
-                    }
-                }, DETECTION_INTERVAL_MS);
-                
-                startButton.textContent = 'Stop';
-                startButton.onclick = stopFaceTracking;
-                
-                console.log('Face tracking started');
-                
+                await videoTile.start(getNextCameraId());
             } catch (error) {
-                console.error('Error starting face tracking:', error);
-                alert('Error accessing camera. Please make sure you have granted camera permissions.');
-            }
-        }
-        
-        // Stop face tracking
-        function stopFaceTracking() {
-            if (detectionTimer) {
-                clearInterval(detectionTimer);
-                detectionTimer = null;
+                console.error('Error starting video tile:', error);
+                stopButton.click();
             }
             
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-                stream = null;
-                videoElement.srcObject = null;
-            }
-            
-            // Clear canvas
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            
-            startButton.textContent = 'Start';
-            startButton.onclick = startFaceTracking;
-            
-            console.log('Face tracking stopped');
-        }
-        
-        // Set up start button
-        startButton.onclick = startFaceTracking;
+            listDevices();
+        };
+
+        startButton.onclick = startTile;
         
         // Clean up resources when page is unloaded
         window.addEventListener('beforeunload', () => {
+            tiles.forEach(tile => tile.stop());
             faceDetector.destroy();
+            tiles.length = 0;
         });
+        
+        let cameraIds = [];
+        let currentCameraIndex = 0;
+        
+        async function listDevices() {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const cameras = devices.filter(device => device.kind === 'videoinput' && device.label);
+            cameraIds = cameras.map(device => device.deviceId);
+            if (!cameraIds[currentCameraIndex]) {
+                currentCameraIndex = 0;
+            }
+        }
+
+        navigator.mediaDevices.ondevicechange = listDevices;
+
+        listDevices();
+
+        function getNextCameraId() {
+            if (!cameraIds[currentCameraIndex]) {
+                currentCameraIndex = 0;
+                return undefined;
+            }
+
+            return cameraIds[currentCameraIndex++];
+        }
+
     </script>
 </body>
 </html>
